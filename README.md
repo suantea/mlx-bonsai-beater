@@ -71,6 +71,10 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 > `http://buddy.local:8080`），IP 变更后客户端自动跟随，无需改配置。GUI 代理已内置
 > `.local → IPv4` 解析，不会误走 IPv6 link-local。
 
+## 接入文档
+
+- **[docs/API.md](docs/API.md)** —— 链接地址 / Key / API 格式 / OpenAI SDK 样例（含端点实测表）
+
 ## 实测基准（本机：16GB 统一内存 Apple M5）
 
 - **短上下文**：decode **52.6 t/s**（threshold 50+ 达标）
