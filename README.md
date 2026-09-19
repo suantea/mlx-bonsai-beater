@@ -74,6 +74,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ## 接入文档
 
 - **[docs/API.md](docs/API.md)** —— 链接地址 / Key / API 格式 / OpenAI SDK 样例（含端点实测表）
+- **[docs/bonsai2-notes.md](docs/bonsai2-notes.md)** —— Bonsai-2 27B 研究：混合注意力 KV 账、GGUF 档位选择、16GB 上 64K/128K 实测、MLX vs llama.cpp fork 取舍
 
 ## 实测基准（本机：16GB 统一内存 Apple M5）
 
@@ -82,11 +83,13 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - **128K（131,706 tok）+ 滑窗 2048 + prefill_step 256**：decode **37.7 t/s**、峰值 **11.51GB**（无 OOM、无抖动）
 - 质量（5 题含 SQL JOIN 陷阱判别）：**无退化**，评分与 35B 原版一致
 
-## 与 Bonsai-27B 实测对比
+## 与 Bonsai 的实测对比
 
-同一台 M5 Air 16GB、同一套 5 题评测：
+同一台 M5 Air 16GB、同一套 5 题评测。注意区分两代 Bonsai：**上一代 Ternary-Bonsai-27B**（纯全注意力、MLX 无 server、长上下文 OOM）与 **新一代 Bonsai-2 27B**（混合注意力、官方提供 llama.cpp fork + GGUF 的服务路径）。
 
-| 项目 | 本方案 (35B-A3B MoE) | Ternary-Bonsai-27B (dense) |
+### 上一代 Ternary-Bonsai-27B（MLX 路径）
+
+| 项目 | 本方案 (35B-A3B MoE) | Ternary-Bonsai-27B (dense, MLX) |
 |---|---|---|
 | 解码速度 | **52.6 t/s** | 6.5 t/s（MLX 实测） |
 | prefill | **834 t/s** | 65 t/s |
@@ -95,7 +98,16 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | 服务端 | ✅ OpenAI 兼容 server | ❌ 官方明示 *No MLX server yet* |
 | 质量（5 题） | 持平 | 持平（重构类略优） |
 
-> Bonsai-27B 官方宣称的 26–44 t/s / 262K 上下文是 **llama.cpp GGUF + 私有 fork** 路径的数字；在 Apple MLX 上它既无 server、长上下文也 OOM。它的成就是**智能密度**（5.9GB 塞进 27B 且质量保留），适合 llama.cpp/CUDA 生态。
+### 新一代 Bonsai-2 27B（官方 llama.cpp fork 路径）
+
+Bonsai-2 是 **混合注意力**（KV 仅 64 KiB/token FP16），官方在 Prism 的 llama.cpp fork + GGUF 上提供完整服务（OpenAI 兼容 server + 内置 web UI + 128K 上下文）。**16GB 上同样可行**：
+
+- **PTQ1_0（5.95GB）+ `BONSAI_KV4=1`（q4_0 K/V）+ `BONSAI_CTX=131072` ≈ 8GB 总量** —— 官方推荐方式，128K 内存余量充足。
+- ptq 提示 info：mainline llama.cpp / Ollama / LM Studio 均无法运行（`Q2_0` 档会被 stock 静默加载并输出乱码，需用 Prism fork 二进制）。
+
+结论：**"小内存跑长上下文"不再只有一条路**。Bonsai-2 27B 是官方有成的对标物（16GB 可跑 128K），验证了本方案方向；本方案的价值在于 MLX 原生解码速度（50+ t/s vs fork 约 28 t/s）、完全自治的滑窗精度与主备调度，以及零依赖 GUI。详细研究与内存账见 **[docs/bonsai2-notes.md](docs/bonsai2-notes.md)**。
+
+> 上一代 Bonsai-27B 官方宣称的 26–44 t/s / 262K 上下文是 llama.cpp GGUF + 私有 fork 路径的数字；在 Apple MLX 上它既无 server、长上下文也 OOM。它的成就是智能密度（5.9GB 塞进 27B 且质量保留）。
 
 ## 项目结构
 
