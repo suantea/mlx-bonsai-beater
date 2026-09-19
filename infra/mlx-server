@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# mlx-server: 双机统一管理入口（public 脱敏版）
+# 用法:
+#   mlx-server status                  # 本机+对端状态总览
+#   mlx-server status local|remote     # 单端
+#   mlx-server start|stop|restart [local|remote]
+#   mlx-server sync                    # rsync 本仓库到对端
+#   mlx-server tunnel start|stop|status
+#   mlx-server router start|stop|status
+# 配置: 环境变量（默认值见下）。REMOTE 必须在部署时显式给出：
+#   MLX_REMOTE="user@host.domain"
+set -euo pipefail
+
+REMOTE_HOST="${MLX_REMOTE:?MLX_REMOTE 未设置，例: export MLX_REMOTE=user@peer.local}"
+REMOTE_FLAG="remote"
+# 主力端点是对端 8080；本机退为备用（8081）。
+MODEL_REL=".cache/hf-models/qwen36-35b-a3b-rq"
+SERVE_REL="${MLX_REPO_REL:-mlx-bonsai-beater/scripts/serve_window.py}"
+REMOTE_PORT=8080
+LOCAL_PORT=8081
+LOCAL_LABEL="com.mlxserver"
+MLX_REPO="${MLX_REPO:-$HOME/mlx-bonsai-beater}"
+
+local_pid() { pgrep -fl serve_window.py || true; }
+remote_cmd() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE_HOST" "$@"; }
+
+check_remote() {
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$REMOTE_HOST" 'echo ok' >/dev/null 2>&1; then
+    echo "   [!] 无法连接 ${REMOTE_HOST}（离线？）"
+    return 1
+  fi
+  return 0
+}
+
+service_status() {
+  local where="$1"
+  echo "── $where ──"
+  local pid
+  if [ "$where" = "local" ]; then
+    pid=$(local_pid)
+  else
+    pid=$(remote_cmd 'pgrep -fl serve_window.py' || true)
+  fi
+  if [ -n "$pid" ]; then
+    echo "   运行中: $pid"
+    echo "   端点: http://127.0.0.1:$( [ "$where" = "local" ] && echo $LOCAL_PORT || echo $REMOTE_PORT )"
+    if [ "$where" = "local" ]; then
+      curl -s -m 5 "http://127.0.0.1:$LOCAL_PORT/v1/models" | head -c 180 || true
+    else
+      remote_cmd "curl -s -m 5 http://127.0.0.1:$REMOTE_PORT/v1/models" | head -c 180 || true
+    fi
+    echo
+  else
+    echo "   未运行"
+  fi
+}
+
+status() {
+  service_status local
+  echo
+  if check_remote; then service_status remote; else echo "对端不可达"; fi
+  echo
+  tunnel_status
+}
+
+action() {
+  local cmd="$1" where="$2"
+  if [ "$where" = "remote" ] && ! check_remote; then return 1; fi
+  case "$cmd" in
+    start)
+      if [ "$where" = "remote" ]; then
+        remote_cmd 'launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mlxserver.remote.plist 2>/dev/null || launchctl load ~/Library/LaunchAgents/com.mlxserver.remote.plist' && echo "   [remote] 已启动"
+      else
+        launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$LOCAL_LABEL.plist" 2>/dev/null || launchctl load "$HOME/Library/LaunchAgents/$LOCAL_LABEL.plist" && echo "   [local] 已启动"
+      fi
+      ;;
+    stop)
+      if [ "$where" = "remote" ]; then
+        remote_cmd 'launchctl bootout gui/$(id -u)/com.mlxserver.remote' 2>/dev/null && echo "   [remote] 已停止" || echo "   [remote] 未运行或已停"
+      else
+        launchctl bootout "gui/$(id -u)/$LOCAL_LABEL" 2>/dev/null && echo "   [local] 已停止" || echo "   [local] 未运行或已停"
+      fi
+      ;;
+    restart)
+      action stop "$where"; sleep 2; action start "$where"
+      ;;
+  esac
+}
+
+sync() {
+  if ! check_remote; then return 1; fi
+  echo "正在同步 $MLX_REPO 到 $REMOTE_HOST ..."
+  rsync -az --partial "$MLX_REPO/" "$REMOTE_HOST:~/$LAST_MLX_REPO_REL/ 2>/dev/null" || \
+    rsync -az --partial "$MLX_REPO/" "$REMOTE_HOST:~/$(basename "$MLX_REPO")/"
+  remote_cmd "chmod +x ~/$(basename "$MLX_REPO")/scripts/serve_window.py"
+  echo "已同步"
+}
+
+# ── 双机调度中心 ──
+# 隧道 (8090): 本机 → 对端 8080 的 SSH 转发。对端在线时 KeepAlive 保持隧道活；
+#              对端关机/断网 → ssh 退出，8090 自然关闭。
+# 路由 (8080): mlx-router 统一入口。每 2s 探活 8090：
+#   - 主通  → 转发对端
+#   - 主断  → 自动切本机 8081（出差/单机兜底）
+# 客户端永远连 127.0.0.1:8080，对端状态对客户端透明。
+TUNNEL_LABEL="com.mlxtunnel"
+TUNNEL_PLIST="$HOME/Library/LaunchAgents/$TUNNEL_LABEL.plist"
+ROUTER_LABEL="com.mlxrouter"
+ROUTER_PLIST="$HOME/Library/LaunchAgents/$ROUTER_LABEL.plist"
+TUNNEL_PORT=8090
+ROUTER_PORT=8080
+
+tunnel_plist() {
+  mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/mlx"
+  cat > "$TUNNEL_PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$TUNNEL_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/ssh</string>
+        <string>-N</string>
+        <string>-o</string>
+        <string>ServerAliveInterval=30</string>
+        <string>-o</string>
+        <string>ServerAliveCountMax=3</string>
+        <string>-o</string>
+        <string>ExitOnForwardFailure=yes</string>
+        <string>-L</string>
+        <string>127.0.0.1:$TUNNEL_PORT:127.0.0.1:8080</string>
+        <string>$REMOTE_HOST</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/mlx/tunnel.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/mlx/tunnel.err.log</string>
+</dict>
+</plist>
+PLISTEOF
+  plutil -lint "$TUNNEL_PLIST" >/dev/null
+}
+
+tunnel_start() {
+  tunnel_plist
+  launchctl bootout "gui/$(id -u)/$TUNNEL_LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$TUNNEL_PLIST" 2>/dev/null || launchctl load "$TUNNEL_PLIST"
+  echo "   [tunnel] 隧道就绪 本机 $TUNNEL_PORT → 对端 8080"
+}
+
+tunnel_stop() {
+  launchctl bootout "gui/$(id -u)/$TUNNEL_LABEL" 2>/dev/null && echo "   [tunnel] 已断" || echo "   [tunnel] 未运行"
+}
+
+tunnel_status() {
+  if lsof -nP -iTCP:$TUNNEL_PORT -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "   [tunnel] 隧道运行中（对端在线，端口 $TUNNEL_PORT）"
+  else
+    echo "   [tunnel] 隧道未连接（对端离线 / 出差单机模式）"
+  fi
+}
+
+router_plist() {
+  mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/mlx"
+  cat > "$ROUTER_PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$ROUTER_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>$MLX_REPO/infra/mlx-router.py</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MLX_PRIMARY</key>
+        <string>http://127.0.0.1:$TUNNEL_PORT</string>
+        <key>MLX_BACKUP</key>
+        <string>http://127.0.0.1:$LOCAL_PORT</string>
+        <key>MLX_PORT</key>
+        <string>$ROUTER_PORT</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/mlx/router.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/mlx/router.err.log</string>
+</dict>
+</plist>
+PLISTEOF
+  plutil -lint "$ROUTER_PLIST" >/dev/null
+}
+
+router_start() {
+  router_plist
+  launchctl bootout "gui/$(id -u)/$ROUTER_LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$ROUTER_PLIST" 2>/dev/null || launchctl load "$ROUTER_PLIST"
+  echo "   [router] 调度中心就绪 本机 $ROUTER_PORT（主=对端 / 备=本机）"
+}
+
+router_stop() {
+  launchctl bootout "gui/$(id -u)/$ROUTER_LABEL" 2>/dev/null && echo "   [router] 已停" || echo "   [router] 未运行"
+}
+
+router_status() {
+  local route
+  route=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "http://127.0.0.1:$ROUTER_PORT/v1/models" 2>/dev/null)
+  local pri
+  if [ -n "$(curl -s -m 3 http://127.0.0.1:$TUNNEL_PORT/v1/models 2>/dev/null)" ]; then pri="主通(对端)"; else pri="主断(本机兜底)"; fi
+  echo "   [router] 统一入口 8080 上线(HTTP $route)  健康检查: $pri"
+}
+
+case "${1:-status}" in
+  status) status ;;
+  start) action start "${2:-both}" ;;
+  stop) action stop "${2:-both}" ;;
+  restart) action restart "${2:-both}" ;;
+  sync) sync ;;
+  tunnel)
+    case "${2:-status}" in
+      start) tunnel_start ;;
+      stop) tunnel_stop ;;
+      restart) tunnel_stop; sleep 1; tunnel_start ;;
+      *) tunnel_status ;;
+    esac
+    ;;
+  router)
+    case "${2:-status}" in
+      start) router_start ;;
+      stop) router_stop ;;
+      restart) router_stop; sleep 1; router_start ;;
+      *) router_status ;;
+    esac
+    ;;
+  *)
+    case "${2:-}" in remote) service_status remote ;; local) service_status local ;; *) status;; esac
+    ;;
+esac
