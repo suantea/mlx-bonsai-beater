@@ -67,6 +67,10 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"<model>","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
+> **建议用 mDNS 域名而非固定 IP**：多机时 Base URL / upstream 填 `http://<主机名>.local:8080/v1`（如
+> `http://buddy.local:8080`），IP 变更后客户端自动跟随，无需改配置。GUI 代理已内置
+> `.local → IPv4` 解析，不会误走 IPv6 link-local。
+
 ## 实测基准（本机：16GB 统一内存 Apple M5）
 
 - **短上下文**：decode **52.6 t/s**（threshold 50+ 达标）

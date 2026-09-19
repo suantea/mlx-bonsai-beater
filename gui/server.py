@@ -10,6 +10,7 @@
 """
 import argparse
 import os
+import socket
 import threading
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +19,24 @@ import posixpath
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STATIC = os.path.join(ROOT, "static")
 UPSTREAM = os.environ.get("MLX_UPSTREAM", "http://127.0.0.1:8080")
+
+
+def resolve_ipv4(url):
+    """把 .local（mDNS）等主机名解析成 IPv4 地址，避免 urllib 走 IPv6 link-local。"""
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(url)
+    if not parts.hostname:
+        return url
+    try:
+        ips = socket.getaddrinfo(parts.hostname, None, socket.AF_INET)
+    except OSError:
+        return url
+    if not ips:
+        return url
+    ip = ips[0][4][0]
+    port = parts.port
+    netloc = ip if port is None else f"{ip}:{port}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -121,7 +140,7 @@ def main():
     ap.add_argument("--port", type=int, default=int(os.environ.get("MLX_GUI_PORT", "7860")))
     ap.add_argument("--upstream", default=UPSTREAM)
     args = ap.parse_args()
-    UPSTREAM = args.upstream.rstrip("/")
+    UPSTREAM = resolve_ipv4(args.upstream.rstrip("/"))
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"[mlx-gui] http://127.0.0.1:{args.port}  upstream={UPSTREAM}", flush=True)
     srv.serve_forever()
